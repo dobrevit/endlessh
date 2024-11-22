@@ -1,6 +1,6 @@
-FROM alpine:3.20 as builder
+FROM alpine:3.20 AS builder
 RUN apk add --no-cache build-base
-ADD endlessh.c Makefile /
+COPY endlessh.c Makefile /
 RUN make
 
 FROM alpine:3.20

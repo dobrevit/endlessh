@@ -1,4 +1,4 @@
-# Endlessh: an SSH tarpit
+# Endlessh: an SSH tarpit with PROXY protocol support
 
 Endlessh is an SSH tarpit [that *very* slowly sends an endless, random
 SSH banner][np]. It keeps SSH clients locked up for hours or even days
@@ -25,6 +25,7 @@ Usage: endlessh [-vhs] [-d MS] [-f CONFIG] [-l LEN] [-m LIMIT] [-p PORT]
   -l INT    Maximum banner line length (3-255) [32]
   -m INT    Maximum number of clients [4096]
   -p INT    Listening port [2222]
+  -P        Enable PROXY protocol support
   -s        Print diagnostics to syslog instead of standard output
   -v        Print diagnostics (repeatable)
 ```
@@ -79,6 +80,25 @@ LogLevel 0
 #   4 = Use IPv4 only
 #   6 = Use IPv6 only
 BindFamily 0
+
+# Set PROXY protocol support
+#   0 = No PROXY protocol support
+#   1 = PROXY protocol support
+ProxySupport 1
+```
+
+## Sample Haproxy configuration
+
+```
+frontend ssh_frontend
+    bind *:2223
+    mode tcp
+    default_backend endlessh_backend
+
+backend endlessh_backend
+    mode tcp
+    server endlessh_server  127.0.0.1:2222 send-proxy
+    server endlessh_server2 127.0.0.1:2222 send-proxy-v2
 ```
 
 ## Build issues
