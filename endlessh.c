@@ -1,4 +1,4 @@
-/* Endlessh: an SSH tarpit
+/* Endlessh: SSH tarpit with HAProxy PROXY Protocol support
  *
  * This is free and unencumbered software released into the public domain.
  */
@@ -26,12 +26,15 @@
 #include <netinet/in.h>
 #include <syslog.h>
 
-#define ENDLESSH_VERSION           1.1
+#define ENDLESSH_VERSION           1.2
 
 #define DEFAULT_PORT              2222
 #define DEFAULT_DELAY            10000  /* milliseconds */
 #define DEFAULT_MAX_LINE_LENGTH     32
 #define DEFAULT_MAX_CLIENTS       4096
+#define DEFAULT_PROXY_SUPPORT       0  /* Disable PROXY support by default */
+
+#define PROXY_V2_SIGNATURE "\r\n\r\n\0\r\nQUIT\n"
 
 #if defined(__FreeBSD__)
 #  define DEFAULT_CONFIG_FILE "/usr/local/etc/endlessh.config"
@@ -43,6 +46,24 @@
 
 #define XSTR(s) STR(s)
 #define STR(s) #s
+
+struct config {
+    int port;
+    int delay;
+    int max_line_length;
+    int max_clients;
+    int bind_family;
+    int proxy_support;
+};
+
+#define CONFIG_DEFAULT { \
+    .port            = DEFAULT_PORT, \
+    .delay           = DEFAULT_DELAY, \
+    .max_line_length = DEFAULT_MAX_LINE_LENGTH, \
+    .max_clients     = DEFAULT_MAX_CLIENTS, \
+    .bind_family     = DEFAULT_BIND_FAMILY, \
+    .proxy_support   = DEFAULT_PROXY_SUPPORT, \
+}
 
 static long long
 epochms(void)
@@ -59,6 +80,112 @@ static enum loglevel {
 } loglevel = log_none;
 
 static void (*logmsg)(enum loglevel level, const char *, ...);
+
+// New function to read the HAProxy PROXY header
+// Function to read both PROXYv1 and PROXYv2 headers
+static int
+read_proxy_header(int fd, struct sockaddr_storage *addr)
+{
+    char buf[108]; // Buffer to store the header
+    ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK);
+    if (n <= 0) {
+        logmsg(log_debug, "Failed to read PROXY header, n=%zd", n);
+        return -1;
+    }
+
+    if (n >= 12 && memcmp(buf, PROXY_V2_SIGNATURE, 12) == 0) {
+        // Handle PROXYv2 protocol
+        if (n < 16) {
+            logmsg(log_debug, "Incomplete PROXYv2 header");
+            return -1;
+        }
+
+        uint16_t total_length = ntohs(*(uint16_t *)(buf + 14));
+        if (n < 16 + total_length) {
+            logmsg(log_debug, "Full PROXYv2 header not yet available");
+            return -1;
+        }
+
+        uint8_t version_and_command = buf[12];
+        if ((version_and_command >> 4) != 2) {
+            logmsg(log_debug, "Unsupported PROXYv2 version: %d", version_and_command >> 4);
+            return -1;
+        }
+
+        uint8_t address_family_and_protocol = buf[13];
+        if ((address_family_and_protocol & 0xF0) == 0x10) {
+            // TCP over IPv4
+            struct sockaddr_in *s = (struct sockaddr_in *)addr;
+            s->sin_family = AF_INET;
+            memcpy(&s->sin_addr, buf + 16, 4);
+            memcpy(&s->sin_port, buf + 24, 2);
+            s->sin_port = ntohs(s->sin_port);
+        } else if ((address_family_and_protocol & 0xF0) == 0x20) {
+            // TCP over IPv6
+            struct sockaddr_in6 *s = (struct sockaddr_in6 *)addr;
+            s->sin6_family = AF_INET6;
+            memcpy(&s->sin6_addr, buf + 16, 16);
+            memcpy(&s->sin6_port, buf + 32, 2);
+            s->sin6_port = ntohs(s->sin6_port);
+        } else {
+            logmsg(log_debug, "Unsupported PROXYv2 address family or protocol");
+            return -1;
+        }
+
+        // Consume the PROXYv2 header
+        recv(fd, buf, 16 + total_length, 0);
+        logmsg(log_debug, "Parsed PROXYv2 header");
+        return 1;
+    } else if (strncmp(buf, "PROXY ", 6) == 0) {
+        // Handle PROXYv1 protocol
+        buf[n] = '\0';
+        // Consume the PROXY header
+        recv(fd, buf, n, 0);
+        logmsg(log_debug, "PROXY header: %s", buf);
+
+        // Split the PROXY header into tokens
+        char *tokens[6];
+        int token_count = 0;
+
+        char *token = strtok(buf, " ");
+        while (token && token_count < 6) {
+            tokens[token_count++] = token;
+            token = strtok(NULL, " ");
+        }
+
+        if (token_count < 6) {
+            logmsg(log_debug, "Invalid PROXY header format");
+            return -1;
+        }
+
+        // Determine address family
+        int family = (strcmp(tokens[1], "TCP4") == 0) ? AF_INET : (strcmp(tokens[1], "TCP6") == 0) ? AF_INET6 : -1;
+        if (family == -1) {
+            logmsg(log_debug, "Unsupported PROXY protocol family: %s", tokens[1]);
+            return -1;
+        }
+
+        // Parse source address
+        if (family == AF_INET) {
+            struct sockaddr_in *s = (struct sockaddr_in *)addr;
+            s->sin_family = AF_INET;
+            inet_pton(AF_INET, tokens[2], &s->sin_addr);
+            s->sin_port = htons(atoi(tokens[4]));
+        } else {
+            struct sockaddr_in6 *s = (struct sockaddr_in6 *)addr;
+            s->sin6_family = AF_INET6;
+            inet_pton(AF_INET6, tokens[2], &s->sin6_addr);
+            s->sin6_port = htons(atoi(tokens[4]));
+        }
+
+        logmsg(log_debug, "Parsed source address: %s, port: %s", tokens[2], tokens[4]);
+
+        return 1;
+    } else {
+        logmsg(log_debug, "No PROXY header found");
+        return 0; // Not a PROXY header
+    }
+}
 
 static void
 logstdio(enum loglevel level, const char *format, ...)
@@ -122,8 +249,9 @@ struct client {
 };
 
 static struct client *
-client_new(int fd, long long send_next)
+client_new(int fd, long long send_next, struct config *config)
 {
+    logmsg(log_debug, "Creating new client for fd=%d", fd);
     struct client *c = malloc(sizeof(*c));
     if (c) {
         c->ipaddr[0] = 0;
@@ -134,7 +262,7 @@ client_new(int fd, long long send_next)
         c->fd = fd;
         c->port = 0;
 
-        /* Set the smallest possible recieve buffer. This reduces local
+        /* Set the smallest possible receive buffer. This reduces local
          * resource usage and slows down the remote end.
          */
         int value = 1;
@@ -143,22 +271,33 @@ client_new(int fd, long long send_next)
         if (r == -1)
             logmsg(log_debug, "errno = %d, %s", errno, strerror(errno));
 
-        /* Get IP address */
+        /* Get IP address using HAProxy PROXY header if available */
         struct sockaddr_storage addr;
         socklen_t len = sizeof(addr);
-        if (getpeername(fd, (struct sockaddr *)&addr, &len) != -1) {
-            if (addr.ss_family == AF_INET) {
-                struct sockaddr_in *s = (struct sockaddr_in *)&addr;
-                c->port = ntohs(s->sin_port);
-                inet_ntop(AF_INET, &s->sin_addr,
-                          c->ipaddr, sizeof(c->ipaddr));
-            } else {
-                struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
-                c->port = ntohs(s->sin6_port);
-                inet_ntop(AF_INET6, &s->sin6_addr,
-                          c->ipaddr, sizeof(c->ipaddr));
-            }
+        if (config->proxy_support && read_proxy_header(fd, &addr) == 1) {
+            // Successfully parsed PROXY header
+        } else if (getpeername(fd, (struct sockaddr *)&addr, &len) != -1) {
+            // Fallback to getpeername if PROXY header is not used or fails
+        } else {
+            logmsg(log_debug, "Failed to get client IP address");
+            free(c);
+            return NULL;
         }
+
+        if (addr.ss_family == AF_INET) {
+            struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+            c->port = ntohs(s->sin_port);
+            inet_ntop(AF_INET, &s->sin_addr,
+                      c->ipaddr, sizeof(c->ipaddr));
+        } else {
+            struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
+            c->port = ntohs(s->sin6_port);
+            inet_ntop(AF_INET6, &s->sin6_addr,
+                      c->ipaddr, sizeof(c->ipaddr));
+        }
+        logmsg(log_debug, "Client connected: IP=%s, Port=%d", c->ipaddr, c->port);
+    } else {
+        logmsg(log_debug, "Failed to allocate memory for new client");
     }
     return c;
 }
@@ -295,20 +434,19 @@ sigusr1_handler(int signal)
     dumpstats = 1;
 }
 
-struct config {
-    int port;
-    int delay;
-    int max_line_length;
-    int max_clients;
-    int bind_family;
-};
-
-#define CONFIG_DEFAULT { \
-    .port            = DEFAULT_PORT, \
-    .delay           = DEFAULT_DELAY, \
-    .max_line_length = DEFAULT_MAX_LINE_LENGTH, \
-    .max_clients     = DEFAULT_MAX_CLIENTS, \
-    .bind_family     = DEFAULT_BIND_FAMILY, \
+static void
+config_set_proxy_support(struct config *c, const char *s, int hardfail)
+{
+    errno = 0;
+    char *end;
+    long tmp = strtol(s, &end, 10);
+    if (errno || *end || (tmp != 0 && tmp != 1)) {
+        fprintf(stderr, "endlessh: Invalid proxy support value: %s\n", s);
+        if (hardfail)
+            exit(EXIT_FAILURE);
+    } else {
+        c->proxy_support = tmp;
+    }
 }
 
 static void
@@ -400,6 +538,7 @@ enum config_key {
     KEY_MAX_CLIENTS,
     KEY_LOG_LEVEL,
     KEY_BIND_FAMILY,
+    KEY_PROXY_SUPPORT,
 };
 
 static enum config_key
@@ -411,7 +550,8 @@ config_key_parse(const char *tok)
         [KEY_MAX_LINE_LENGTH] = "MaxLineLength",
         [KEY_MAX_CLIENTS]     = "MaxClients",
         [KEY_LOG_LEVEL]       = "LogLevel",
-        [KEY_BIND_FAMILY]     = "BindFamily"
+        [KEY_BIND_FAMILY]     = "BindFamily",
+        [KEY_PROXY_SUPPORT]   = "ProxySupport",
     };
     for (size_t i = 1; i < sizeof(table) / sizeof(*table); i++)
         if (!strcmp(tok, table[i]))
@@ -434,7 +574,7 @@ config_load(struct config *c, const char *file, int hardfail)
             if (comment)
                 *comment = 0;
 
-            /* Parse tokes on line */
+            /* Parse tokens on line */
             char *save = 0;
             char *tokens[3];
             int ntokens = 0;
@@ -493,6 +633,9 @@ config_load(struct config *c, const char *file, int hardfail)
                         loglevel = v;
                     }
                 } break;
+                case KEY_PROXY_SUPPORT:
+                    config_set_proxy_support(c, tokens[1], hardfail);
+                    break;
             }
         }
 
@@ -511,6 +654,7 @@ config_log(const struct config *c)
         c->bind_family == AF_INET6 ? "IPv6 Only" :
         c->bind_family == AF_INET  ? "IPv4 Only" :
                                 "IPv4 Mapped IPv6");
+    logmsg(log_info, "ProxySupport %s", c->proxy_support ? "Enabled" : "Disabled");
 }
 
 static void
@@ -530,6 +674,8 @@ usage(FILE *f)
     fprintf(f, "  -m INT    Maximum number of clients ["
             XSTR(DEFAULT_MAX_CLIENTS) "]\n");
     fprintf(f, "  -p INT    Listening port [" XSTR(DEFAULT_PORT) "]\n");
+    fprintf(f, "  -s        Log to syslog\n");
+    fprintf(f, "  -P        Enable HAProxy PROXY protocol support\n");
     fprintf(f, "  -v        Print diagnostics to standard output "
             "(repeatable)\n");
     fprintf(f, "  -V        Print version information and exit\n");
@@ -641,7 +787,7 @@ main(int argc, char **argv)
     config_load(&config, config_file, 1);
 
     int option;
-    while ((option = getopt(argc, argv, "46d:f:hl:m:p:svV")) != -1) {
+    while ((option = getopt(argc, argv, "46d:f:hl:m:p:PsvV")) != -1) {
         switch (option) {
             case '4':
                 config_set_bind_family(&config, "4", 1);
@@ -675,6 +821,9 @@ main(int argc, char **argv)
                 break;
             case 'p':
                 config_set_port(&config, optarg, 1);
+                break;
+            case 'P':
+                config_set_proxy_support(&config, "1", 1);
                 break;
             case 's':
                 logmsg = logsyslog;
@@ -819,7 +968,7 @@ main(int argc, char **argv)
                 }
             } else {
                 long long send_next = epochms() + config.delay;
-                struct client *client = client_new(fd, send_next);
+                struct client *client = client_new(fd, send_next, &config);
                 int flags = fcntl(fd, F_GETFL, 0);      /* cannot fail */
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK); /* cannot fail */
                 if (!client) {
